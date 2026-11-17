@@ -72,6 +72,11 @@ Flags:
   -D, --download-only
     During a restore this will only download the target files from GCS
 
+  -R, --direct
+    During a restore extract the snapshot straight into the Cassandra directories
+    instead of staging it in --backupdir/restore and copying it with rsync. Saves a
+    full copy of the data in time and disk space. Uses pigz for .tgz files if installed
+
   -f, --force
     Used to force the restore without confirmation prompt
 
@@ -451,6 +456,7 @@ function verbose_vars() {
   logverbose "CQLSH: ${CQLSH}"
   logverbose "CQLSH_DEFAULT_HOST: ${CQLSH_DEFAULT_HOST}"
   logverbose "DATE: ${DATE}"
+  logverbose "DIRECT_RESTORE: ${DIRECT_RESTORE}"
   logverbose "DOWNLOAD_ONLY: ${DOWNLOAD_ONLY}"
   logverbose "DRY_RUN: ${DRY_RUN}"
   logverbose "FORCE_RESTORE: ${FORCE_RESTORE}"
@@ -854,6 +860,10 @@ function restore() {
   loginfo "****NOTE: Simple restore procedure activated*****************"
   loginfo "****NOTE: Restore requires a full snapshot backup************"
   loginfo "****NOTE: Incremental backups must be manually restored******\n"
+  if ${DIRECT_RESTORE} && ! ${DOWNLOAD_ONLY}; then
+    restore_direct
+    return
+  fi
   restore_get_files
   if ${DOWNLOAD_ONLY} ; then
     loginfo "Backup file downloaded to ${BACKUP_DIR}/restore, this script will only" \
@@ -868,6 +878,87 @@ function restore() {
     restore_start_cassandra
     restore_cleanup
   fi
+}
+
+# Restore without the staging copy: move the current directories aside, then extract
+# the snapshot straight into the Cassandra directories (paths are stored in the archive)
+function restore_direct() {
+  loginfo "Direct restore: extracting straight into the Cassandra directories"
+  restore_confirm
+  restore_stop_cassandra
+  restore_direct_move_old
+  restore_direct_download
+  restore_direct_extract
+  restore_direct_move_snapshots
+  restore_start_cassandra
+  restore_cleanup
+}
+
+# Same renames restore_files does, done before extraction since that writes in place
+function restore_direct_move_old() {
+  for i in "${data_file_directories[@]}" "${commitlog_directory}" "${saved_caches_directory}"
+  do
+    if ${DRY_RUN}; then
+      loginfo "DRY RUN: mv ${i} ${i}_old_${DATE}"
+    else
+      if [ -e "${i}" ]; then
+        loginfo "Renaming ${i} to ${i}_old_${DATE} if anything fails, manually rename it"
+        mv "${i}" "${i}_old_${DATE}"
+      fi
+      mkdir -p "${i}"
+    fi
+  done
+}
+
+function restore_direct_download() {
+  loginfo "Downloading restore files from GCS"
+  if ${DRY_RUN}; then
+    loginfo "DRY RUN: ${GSUTIL} -m cp ${GCS_BUCKET} ${COMPRESS_DIR}"
+  else
+    ${GSUTIL} -m cp "${GCS_BUCKET}" "${COMPRESS_DIR}"
+  fi
+}
+
+# Split parts concatenate in glob order (split -d suffixes sort lexically: 00..89, 9000..)
+# --keep-directory-symlink keeps a symlinked /var/lib/cassandra pointing at its disk
+function restore_direct_extract() {
+  local cflag="${TAR_CFLAG}"
+  if [ "${TAR_CFLAG}" = "-z" ]; then
+    if [ -n "$(command -v pigz)" ]; then
+      cflag="-I pigz"
+    else
+      loginfo "pigz not found, decompressing with gzip (slower)"
+    fi
+  fi
+  loginfo "Extracting ${COMPRESS_DIR}/${RESTORE_FILE} to /"
+  local cmd
+  cmd="cat ${COMPRESS_DIR}/${RESTORE_FILE} | ${TAR} -x ${cflag} -f - -C / --keep-directory-symlink"
+  if ${DRY_RUN}; then
+    loginfo "DRY RUN: ${cmd}"
+  else
+    eval "${cmd}"
+  fi
+}
+
+# Move snapshot files from <table>/snapshots/snap-<DATE>/ into <table>/. The emptied
+# snap-<DATE> dirs keep manifest.json and schema.cql and record which backup was restored
+function restore_direct_move_snapshots() {
+  loginfo "Moving snapshot files up two directories to their keyspace base directories"
+  if ${DRY_RUN}; then
+    return
+  fi
+  local snap_dir
+  for i in "${data_file_directories[@]}"
+  do
+    find "${i}" -mindepth 4 -maxdepth 4 -type d -path '*/snapshots/snap-*' \
+      | while read -r snap_dir; do
+          find "${snap_dir}" -maxdepth 1 -type f ! -name manifest.json ! -name schema.cql \
+            -exec mv -t "${snap_dir}/../.." {} +
+        done
+    restore_fix_perms "${i}"
+  done
+  restore_fix_perms "${commitlog_directory}"
+  restore_fix_perms "${saved_caches_directory}"
 }
 
 # Orchestrate the retrieval and extraction of the files to recover
@@ -1120,6 +1211,7 @@ for arg in "$@"; do
     "--clear-old-ss")   set -- "$@" "-c" ;;
     "--clear-old-inc")   set -- "$@" "-C" ;;
     "--download-only")   set -- "$@" "-D" ;;
+    "--direct")   set -- "$@" "-R" ;;
     "--force")   set -- "$@" "-f" ;;
     "--help") set -- "$@" "-h" ;;
     "--home-dir") set -- "$@" "-H" ;;
@@ -1140,7 +1232,7 @@ for arg in "$@"; do
   esac
 done
 
-while getopts 'a:b:BcCd:DfhH:iIjkl:LnN:p:rs:S:T:u:U:vwy:z' OPTION
+while getopts 'a:b:BcCd:DfhH:iIjkl:LnN:p:rRs:S:T:u:U:vwy:z' OPTION
 do
   case $OPTION in
       a)
@@ -1208,6 +1300,9 @@ do
       r)
           ACTION="restore"
           ;;
+      R)
+          DIRECT_RESTORE=true
+          ;;
       s)
           SPLIT_SIZE="${OPTARG/[a-z]*[A-Z]*}M" #replace letters with M
           SPLIT_FILE=true
@@ -1261,6 +1356,7 @@ COMPRESSION=${COMPRESSION:-false} #flag to use tar+gz
 CQLSH="$(which cqlsh)" #which cqlsh command
 CQLSH_DEFAULT_HOST="127.0.0.1" #cqlsh host - currently hard coded
 DATE="$(prepare_date +%F_%H-%M )" #nicely formatted date string for files
+DIRECT_RESTORE=${DIRECT_RESTORE:-false} #restore by extracting in place, without the staging copy
 DOWNLOAD_ONLY=${DOWNLOAD_ONLY:-false} #user flag or used if incremental restore is requested
 DRY_RUN=${DRY_RUN:-false} #flag to only print what would have executed
 ERROR_COUNT=0 #used in validation step will exit if > 0
