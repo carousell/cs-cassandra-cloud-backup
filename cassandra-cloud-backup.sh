@@ -920,7 +920,9 @@ function restore_direct_download() {
 }
 
 # Split parts concatenate in glob order (split -d suffixes sort lexically: 00..89, 9000..)
-# --keep-directory-symlink keeps a symlinked /var/lib/cassandra pointing at its disk
+# --keep-directory-symlink keeps a symlinked /var/lib/cassandra pointing at its disk.
+# The backup also archives the source node's cassandra.yaml (copy_other_files); like
+# restore_files, leave this node's config alone.
 function restore_direct_extract() {
   local cflag="${TAR_CFLAG}"
   if [ "${TAR_CFLAG}" = "-z" ]; then
@@ -933,6 +935,7 @@ function restore_direct_extract() {
   loginfo "Extracting ${COMPRESS_DIR}/${RESTORE_FILE} to /"
   local cmd
   cmd="cat ${COMPRESS_DIR}/${RESTORE_FILE} | ${TAR} -x ${cflag} -f - -C / --keep-directory-symlink"
+  cmd+=" --exclude='*.yaml'"
   if ${DRY_RUN}; then
     loginfo "DRY RUN: ${cmd}"
   else
